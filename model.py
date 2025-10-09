@@ -162,6 +162,14 @@ class GroupedQueryAttention(nn.Module):
             k_te = k.transpose(1, 2).contiguous()
             v_te = v.transpose(1, 2).contiguous()
             
+            # Ensure same dtype (QK norm might change Q/K dtype, but V is unchanged)
+            # TE DotProductAttention requires all inputs to have same dtype
+            target_dtype = q_te.dtype
+            if k_te.dtype != target_dtype:
+                k_te = k_te.to(target_dtype)
+            if v_te.dtype != target_dtype:
+                v_te = v_te.to(target_dtype)
+            
             # TE DotProductAttention (FP8-optimized)
             output = self.te_attn(q_te, k_te, v_te, attention_mask=None)
             

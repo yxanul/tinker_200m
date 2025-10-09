@@ -140,6 +140,34 @@ The training script logs:
 - **Memory**: ~12-16GB GPU memory with BF16
 - **Final loss**: ~2.5-3.0 (depending on data quality)
 
+## Memory Optimization
+
+If you encounter OOM errors, try these in order:
+
+1. **Reduce batch size** (adjust grad_accum to maintain effective batch):
+```bash
+# Example: 32GB GPU
+python train.py --batch_size 8 --grad_accum_steps 8  # Effective batch = 64
+
+# Example: 24GB GPU
+python train.py --batch_size 4 --grad_accum_steps 16  # Effective batch = 64
+
+# Example: 16GB GPU
+python train.py --batch_size 2 --grad_accum_steps 32  # Effective batch = 64
+```
+
+2. **Reduce sequence length**:
+```bash
+python train.py --batch_size 16 --max_seq_len 1024
+```
+
+3. **Reduce num_workers** (saves CPU memory):
+```bash
+python train.py --num_workers 4
+```
+
+4. **Enable gradient checkpointing** (trade compute for memory - requires code modification)
+
 ## Checkpoints
 
 Checkpoints are saved to `./checkpoints/` by default:
@@ -184,6 +212,30 @@ Each checkpoint contains:
 --no_wandb  # Disable WandB
 ```
 
+## Training Dynamics
+
+### Gradient Norms
+The logged `GradNorm` is the **pre-clipping** gradient norm (standard PyTorch behavior). High values (>1.0) are expected, especially early in training:
+- Steps 1-100: Often 5-30 (normal during warmup)
+- Steps 100-1000: Gradually decreases to 2-5
+- Steps 1000+: Stabilizes around 1-3
+
+**Important**: Gradients ARE being clipped to 1.0 despite high reported norms - this is how `clip_grad_norm_` works.
+
+### Loss Dynamics
+Fast initial loss drop is normal for well-initialized models:
+- Step 1-50: Loss drops from ~10 to ~6 (learning basic statistics)
+- Step 50-500: Loss drops to ~3-4 (learning common patterns)
+- Step 500-5000: Gradual improvement to ~2.5-3.0
+- Step 5000+: Slow convergence
+
+### Data Diversity
+To verify your data pipeline is working correctly:
+```bash
+python verify_data_diversity.py
+```
+This checks for duplicate batches and ensures workers are producing diverse data.
+
 ## Notes
 
 - The model uses BF16 by default (requires Ampere+ GPUs)
@@ -191,6 +243,7 @@ Each checkpoint contains:
 - Dataset streams from HuggingFace (no local download needed)
 - Eval set uses different seed from training set
 - QK normalization allows 5x higher learning rate (3e-3)
+- Each worker gets a unique shard of data (no repetition)
 
 ## License
 

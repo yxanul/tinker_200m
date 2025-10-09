@@ -246,6 +246,8 @@ class Trainer:
                 accum_loss += loss.item()
 
             # Gradient clipping
+            # Note: grad_norm is the total norm BEFORE clipping (PyTorch behavior)
+            # Gradients are still clipped to args.grad_clip (default 1.0)
             if self.args.grad_clip > 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),

@@ -44,18 +44,30 @@ class StreamingTextDataset(IterableDataset):
             streaming=True,
         )
 
-        # Shuffle to avoid stale data from 2013
-        dataset = dataset.shuffle(seed=self.seed, buffer_size=self.buffer_size)
-
         # Skip first N samples for validation split
         if self.skip_first > 0:
             dataset = dataset.skip(self.skip_first)
 
-        # Distributed splitting
+        # Distributed splitting (across GPUs/nodes)
         if self.is_distributed:
             rank = int(os.environ.get("RANK", 0))
             world_size = int(os.environ.get("WORLD_SIZE", 1))
             dataset = split_dataset_by_node(dataset, rank=rank, world_size=world_size)
+
+        # Worker-specific splitting (within each GPU/node)
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            # Split dataset among workers
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+            dataset = split_dataset_by_node(dataset, rank=worker_id, world_size=num_workers)
+            # Use worker-specific seed for shuffling
+            effective_seed = self.seed + worker_id
+        else:
+            effective_seed = self.seed
+
+        # Shuffle to avoid stale data from 2013
+        dataset = dataset.shuffle(seed=effective_seed, buffer_size=self.buffer_size)
 
         self.dataset = dataset
 

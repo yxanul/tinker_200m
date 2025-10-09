@@ -1,0 +1,7 @@
+torch
+transformers
+datasets
+wandb
+accelerate
+sentencepiece
+huggingface_hub[cli]

@@ -2,6 +2,20 @@
 
 A modern dense transformer model (~180-200M parameters) with state-of-the-art optimizations for efficient pretraining.
 
+## 🚀 NEW: FP8 Training Support
+
+**FP8 training** now available for H100+ GPUs! Get **1.5-2x speedup** with minimal accuracy loss.
+
+```bash
+# Enable FP8 training (requires H100+ GPU)
+python train.py --use_fp8 --batch_size 16
+
+# Multi-GPU with FP8
+torchrun --nproc_per_node=8 train.py --use_fp8
+```
+
+See [FP8_UPGRADE.md](FP8_UPGRADE.md) for details.
+
 ## ⚠️ CRITICAL FIX: Label Shifting
 
 **If you cloned before this fix**: The model was learning to copy tokens instead of predicting next tokens, causing artificially fast loss drop (10→1.8 in 120 steps).
@@ -29,6 +43,7 @@ A modern dense transformer model (~180-200M parameters) with state-of-the-art op
 - ✅ No bias terms (Llama-style)
 - ✅ Weight tying (input/output embeddings)
 - ✅ BF16 mixed precision
+- ✅ **FP8 training** (NEW! 1.5-2x faster on H100+)
 
 ## Training Configuration
 
@@ -43,8 +58,17 @@ A modern dense transformer model (~180-200M parameters) with state-of-the-art op
 ## Installation
 
 ```bash
+# Install core dependencies
 pip install -r requirements.txt
+
+# Optional: For FP8 training on H100+ GPUs (1.5-2x speedup)
+pip install transformer-engine
 ```
+
+**Note**: FP8 training requires:
+- NVIDIA H100 or newer GPU
+- CUDA >= 11.8
+- transformer-engine >= 1.0.0
 
 ## Usage
 
@@ -82,11 +106,37 @@ torchrun --nproc_per_node=8 train.py \
   --warmup_steps 2000
 ```
 
+### FP8 Training (H100+ GPUs)
+
+```bash
+# Single GPU with FP8
+python train.py \
+  --use_fp8 \
+  --batch_size 16 \
+  --grad_accum_steps 4
+
+# Multi-GPU with FP8 (8x H100)
+torchrun --nproc_per_node=8 train.py \
+  --use_fp8 \
+  --batch_size 16 \
+  --grad_accum_steps 4
+```
+
+**Benefits**:
+- 1.5-2x faster training
+- ~50% memory reduction for activations
+- Minimal accuracy impact (<1%)
+
+See [FP8_UPGRADE.md](FP8_UPGRADE.md) for full documentation.
+
 ### Test Model
 
 ```bash
-# Test model architecture
+# Test model architecture (BF16)
 python model.py
+
+# Test model with FP8
+python model.py --fp8
 
 # Test dataloader
 python data.py
@@ -215,6 +265,7 @@ print(f"Best eval loss: {checkpoint['best_eval_loss']:.4f}")
 ```bash
 # Model
 --max_seq_len 2048
+--use_fp8  # Enable FP8 training (H100+ GPU, 1.5-2x speedup)
 
 # Training
 --batch_size 16

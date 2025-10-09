@@ -2,6 +2,12 @@
 
 A modern dense transformer model (~180-200M parameters) with state-of-the-art optimizations for efficient pretraining.
 
+## ⚠️ CRITICAL FIX: Label Shifting
+
+**If you cloned before this fix**: The model was learning to copy tokens instead of predicting next tokens, causing artificially fast loss drop (10→1.8 in 120 steps).
+
+**Fixed**: Model now properly shifts logits and labels for true next-token prediction. See [CRITICAL_BUG_LABEL_SHIFT.md](CRITICAL_BUG_LABEL_SHIFT.md) for details.
+
 ## Model Architecture
 
 - **Parameters**: ~180-200M (dense, all active)
@@ -177,15 +183,32 @@ python train.py --num_workers 4
 ## Checkpoints
 
 Checkpoints are saved to `./checkpoints/` by default:
-- Every 5000 steps: `checkpoint_step_5000.pt`
-- Final model: `final_model.pt`
+- **Every 500 steps**: `checkpoint_step_500.pt`, `checkpoint_step_1000.pt`, etc.
+- **Best model** (lowest eval loss): `best_model.pt` (updated whenever eval loss improves)
+- **Final model**: `final_model.pt` (saved at end of training)
 
 Each checkpoint contains:
 - Model weights
 - Optimizer state
 - Step count
 - Tokens seen
+- Best eval loss
 - Training args
+
+### Loading Checkpoints
+
+```python
+import torch
+from model import create_model
+
+# Load best model
+checkpoint = torch.load("checkpoints/best_model.pt")
+model = create_model()
+model.load_state_dict(checkpoint["model"])
+
+print(f"Loaded model from step {checkpoint['step']}")
+print(f"Best eval loss: {checkpoint['best_eval_loss']:.4f}")
+```
 
 ## Configuration Options
 
@@ -211,7 +234,7 @@ Each checkpoint contains:
 --log_interval 10
 --eval_interval 500
 --eval_batches 50
---save_interval 5000
+--save_interval 500  # Save checkpoint every 500 steps + best model
 --checkpoint_dir ./checkpoints
 --wandb_project "dense-llm-pretraining"
 --run_name "dense-180m"
@@ -229,11 +252,19 @@ The logged `GradNorm` is the **pre-clipping** gradient norm (standard PyTorch be
 **Important**: Gradients ARE being clipped to 1.0 despite high reported norms - this is how `clip_grad_norm_` works.
 
 ### Loss Dynamics
-Fast initial loss drop is normal for well-initialized models:
-- Step 1-50: Loss drops from ~10 to ~6 (learning basic statistics)
-- Step 50-500: Loss drops to ~3-4 (learning common patterns)
-- Step 500-5000: Gradual improvement to ~2.5-3.0
-- Step 5000+: Slow convergence
+
+**After the label shift fix**, expect realistic, gradual learning:
+
+- **Step 1-100**: Loss ~10 → ~8 (learning token distributions)
+- **Step 100-500**: Loss ~8 → ~5 (basic patterns emerge)
+- **Step 500-2000**: Loss ~5 → ~4 (understanding sequences)
+- **Step 2000-10000**: Loss ~4 → ~3 (language understanding)
+- **Step 10000+**: Loss ~2.5-3.0 (converging)
+
+**Warning**: If you see loss drop to <3.0 before step 1000, something is wrong:
+- Check that model.py has label shifting (`shift_logits = logits[..., :-1, :]`)
+- Verify data diversity with `verify_data_diversity.py`
+- Loss ~1.5-2.0 in <500 steps = model is cheating (copying tokens)
 
 ### Data Diversity
 

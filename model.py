@@ -4,8 +4,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
+try:
+    import transformer_engine.pytorch as te
+    from transformer_engine.common.recipe import DelayedScaling, Format
+    HAS_TE = True
+except ImportError:
+    HAS_TE = False
+    print("Warning: transformer_engine not available. FP8 training will be disabled.")
+
 
 class RMSNorm(nn.Module):
+    """Fallback RMSNorm for when TE is not available"""
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
@@ -60,6 +69,7 @@ class GroupedQueryAttention(nn.Module):
         head_dim: int,
         use_qk_norm: bool = True,
         use_flash: bool = True,
+        use_fp8: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
@@ -68,16 +78,25 @@ class GroupedQueryAttention(nn.Module):
         self.head_dim = head_dim
         self.n_rep = n_heads // n_kv_heads
         self.use_flash = use_flash and hasattr(F, 'scaled_dot_product_attention')
+        self.use_fp8 = use_fp8 and HAS_TE
 
-        self.q_proj = nn.Linear(d_model, n_heads * head_dim, bias=False)
-        self.k_proj = nn.Linear(d_model, n_kv_heads * head_dim, bias=False)
-        self.v_proj = nn.Linear(d_model, n_kv_heads * head_dim, bias=False)
-        self.o_proj = nn.Linear(n_heads * head_dim, d_model, bias=False)
+        if self.use_fp8 and not HAS_TE:
+            raise RuntimeError("FP8 requested but transformer_engine not available. Install with: pip install transformer-engine")
+
+        # Use TE Linear for FP8 support
+        LinearLayer = te.Linear if self.use_fp8 else nn.Linear
+        
+        self.q_proj = LinearLayer(d_model, n_heads * head_dim, bias=False)
+        self.k_proj = LinearLayer(d_model, n_kv_heads * head_dim, bias=False)
+        self.v_proj = LinearLayer(d_model, n_kv_heads * head_dim, bias=False)
+        self.o_proj = LinearLayer(n_heads * head_dim, d_model, bias=False)
 
         self.use_qk_norm = use_qk_norm
         if use_qk_norm:
-            self.q_norm = RMSNorm(head_dim)
-            self.k_norm = RMSNorm(head_dim)
+            # Use TE RMSNorm for FP8 if available, else fallback
+            NormLayer = te.RMSNorm if (self.use_fp8 and HAS_TE) else RMSNorm
+            self.q_norm = NormLayer(head_dim, eps=1e-6) if self.use_fp8 else RMSNorm(head_dim)
+            self.k_norm = NormLayer(head_dim, eps=1e-6) if self.use_fp8 else RMSNorm(head_dim)
 
     def forward(
         self,
@@ -127,11 +146,19 @@ class GroupedQueryAttention(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, d_model: int, ffn_hidden: int):
+    def __init__(self, d_model: int, ffn_hidden: int, use_fp8: bool = False):
         super().__init__()
-        self.w1 = nn.Linear(d_model, ffn_hidden, bias=False)
-        self.w2 = nn.Linear(ffn_hidden, d_model, bias=False)
-        self.w3 = nn.Linear(d_model, ffn_hidden, bias=False)
+        self.use_fp8 = use_fp8 and HAS_TE
+        
+        if self.use_fp8 and not HAS_TE:
+            raise RuntimeError("FP8 requested but transformer_engine not available")
+        
+        # Use TE Linear for FP8 support
+        LinearLayer = te.Linear if self.use_fp8 else nn.Linear
+        
+        self.w1 = LinearLayer(d_model, ffn_hidden, bias=False)
+        self.w2 = LinearLayer(ffn_hidden, d_model, bias=False)
+        self.w3 = LinearLayer(d_model, ffn_hidden, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
@@ -148,12 +175,21 @@ class TransformerBlock(nn.Module):
         norm_eps: float = 1e-6,
         use_qk_norm: bool = True,
         use_flash: bool = True,
+        use_fp8: bool = False,
     ):
         super().__init__()
-        self.attn_norm = RMSNorm(d_model, norm_eps)
-        self.attn = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, use_qk_norm, use_flash)
-        self.ffn_norm = RMSNorm(d_model, norm_eps)
-        self.ffn = SwiGLU(d_model, ffn_hidden)
+        self.use_fp8 = use_fp8 and HAS_TE
+        
+        if self.use_fp8 and not HAS_TE:
+            raise RuntimeError("FP8 requested but transformer_engine not available")
+        
+        # Use TE RMSNorm for FP8 if available
+        NormLayer = te.RMSNorm if self.use_fp8 else RMSNorm
+        
+        self.attn_norm = NormLayer(d_model, eps=norm_eps) if self.use_fp8 else RMSNorm(d_model, norm_eps)
+        self.attn = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, use_qk_norm, use_flash, use_fp8)
+        self.ffn_norm = NormLayer(d_model, eps=norm_eps) if self.use_fp8 else RMSNorm(d_model, norm_eps)
+        self.ffn = SwiGLU(d_model, ffn_hidden, use_fp8)
 
     def forward(
         self,
@@ -183,6 +219,7 @@ class DenseTransformer(nn.Module):
         use_qk_norm: bool = True,
         use_flash: bool = True,
         tie_weights: bool = True,
+        use_fp8: bool = False,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -190,6 +227,24 @@ class DenseTransformer(nn.Module):
         self.n_layers = n_layers
         self.max_seq_len = max_seq_len
         self.tie_weights = tie_weights
+        self.use_fp8 = use_fp8 and HAS_TE
+        
+        if self.use_fp8 and not HAS_TE:
+            raise RuntimeError(
+                "FP8 training requested but transformer_engine not available. "
+                "Install with: pip install transformer-engine"
+            )
+        
+        # FP8 recipe: E4M3 forward, E5M2 backward (HYBRID mode)
+        if self.use_fp8:
+            self.fp8_recipe = DelayedScaling(
+                fp8_format=Format.HYBRID,  # E4M3 forward, E5M2 backward
+                amax_history_len=16,
+                amax_compute_algo="max"
+            )
+            print("✓ FP8 training enabled (E4M3 forward, E5M2 backward)")
+        else:
+            self.fp8_recipe = None
 
         self.tok_embeddings = nn.Embedding(vocab_size, d_model)
         self.rope = RotaryEmbedding(head_dim, max_seq_len, rope_theta)
@@ -197,13 +252,22 @@ class DenseTransformer(nn.Module):
         self.layers = nn.ModuleList([
             TransformerBlock(
                 d_model, n_heads, n_kv_heads, head_dim, ffn_hidden,
-                norm_eps, use_qk_norm, use_flash
+                norm_eps, use_qk_norm, use_flash, use_fp8
             )
             for _ in range(n_layers)
         ])
 
-        self.norm = RMSNorm(d_model, norm_eps)
-        self.output = nn.Linear(d_model, vocab_size, bias=False)
+        # Use TE RMSNorm for final norm if FP8 enabled
+        if self.use_fp8:
+            self.norm = te.RMSNorm(d_model, eps=norm_eps)
+        else:
+            self.norm = RMSNorm(d_model, norm_eps)
+        
+        # Output projection (TE Linear if FP8)
+        if self.use_fp8:
+            self.output = te.Linear(d_model, vocab_size, bias=False)
+        else:
+            self.output = nn.Linear(d_model, vocab_size, bias=False)
 
         if tie_weights:
             self.output.weight = self.tok_embeddings.weight
@@ -218,13 +282,14 @@ class DenseTransformer(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, labels: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         batch_size, seq_len = input_ids.shape
-        h = self.tok_embeddings(input_ids)
-
-        rope_cos, rope_sin = self.rope(h, seq_len)
-
-        for layer in self.layers:
-            h = layer(h, rope_cos, rope_sin)
-
+        
+        # Use FP8 autocast if enabled
+        if self.use_fp8:
+            with te.fp8_autocast(enabled=True, fp8_recipe=self.fp8_recipe):
+                h = self._forward_impl(input_ids, seq_len)
+        else:
+            h = self._forward_impl(input_ids, seq_len)
+        
         h = self.norm(h)
         logits = self.output(h)
 
@@ -242,6 +307,16 @@ class DenseTransformer(nn.Module):
             )
 
         return logits, loss
+    
+    def _forward_impl(self, input_ids: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """Core forward pass that can be wrapped with FP8 autocast"""
+        h = self.tok_embeddings(input_ids)
+        rope_cos, rope_sin = self.rope(h, seq_len)
+
+        for layer in self.layers:
+            h = layer(h, rope_cos, rope_sin)
+        
+        return h
 
     def get_num_params(self, non_embedding: bool = True) -> int:
         n_params = sum(p.numel() for p in self.parameters())
@@ -252,7 +327,17 @@ class DenseTransformer(nn.Module):
         return n_params
 
 
-def create_model():
+def create_model(use_fp8: bool = False):
+    """
+    Create a DenseTransformer model.
+    
+    Args:
+        use_fp8: Enable FP8 training (requires transformer_engine and H100+ GPU)
+                 E4M3 format for forward pass, E5M2 for backward pass
+    
+    Returns:
+        DenseTransformer model
+    """
     model = DenseTransformer(
         vocab_size=32768,
         d_model=768,
@@ -267,6 +352,7 @@ def create_model():
         use_qk_norm=True,
         use_flash=True,
         tie_weights=True,
+        use_fp8=use_fp8,
     )
     
     total_params = model.get_num_params(non_embedding=False) / 1e6
@@ -274,21 +360,65 @@ def create_model():
     print(f"Total parameters: {total_params:.2f}M")
     print(f"Non-embedding parameters: {non_emb_params:.2f}M")
     
+    if use_fp8:
+        if HAS_TE:
+            print("✓ FP8 training mode enabled")
+            print("  - Format: E4M3 (forward), E5M2 (backward)")
+            print("  - Requires: H100 or newer GPU")
+            print("  - Expected speedup: 1.5-2x over BF16")
+        else:
+            print("⚠ FP8 requested but transformer_engine not installed")
+            print("  Install with: pip install transformer-engine")
+    else:
+        print("✓ BF16/FP32 training mode")
+    
     return model
 
 
 if __name__ == "__main__":
-    model = create_model()
+    import argparse
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fp8", action="store_true", help="Enable FP8 training")
+    args = parser.parse_args()
+    
+    print("="*60)
+    print("Dense Transformer Model Test")
+    print("="*60)
+    
+    # Create model
+    model = create_model(use_fp8=args.fp8)
     
     # Test forward pass
     batch_size, seq_len = 2, 128
     input_ids = torch.randint(0, 32768, (batch_size, seq_len))
     labels = torch.randint(0, 32768, (batch_size, seq_len))
     
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        model = model.to(device)
+        input_ids = input_ids.to(device)
+        labels = labels.to(device)
+        print(f"\n✓ Testing on GPU: {torch.cuda.get_device_name()}")
+    else:
+        device = torch.device("cpu")
+        print(f"\n✓ Testing on CPU")
+    
+    model.eval()
     with torch.no_grad():
         logits, loss = model(input_ids, labels)
     
     print(f"\nTest forward pass:")
-    print(f"Input shape: {input_ids.shape}")
-    print(f"Output shape: {logits.shape}")
-    print(f"Loss: {loss.item():.4f}")
+    print(f"  Input shape: {input_ids.shape}")
+    print(f"  Output shape: {logits.shape}")
+    print(f"  Loss: {loss.item():.4f}")
+    print(f"  Device: {logits.device}")
+    print(f"  Dtype: {logits.dtype}")
+    
+    if args.fp8 and HAS_TE:
+        print(f"\n✓ FP8 forward pass successful!")
+        print(f"  Note: FP8 provides 1.5-2x speedup on H100+ GPUs")
+    
+    print("\n" + "="*60)
+    print("Test completed successfully!")
+    print("="*60)

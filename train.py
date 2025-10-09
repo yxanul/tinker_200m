@@ -69,6 +69,7 @@ class Trainer:
 
         self.global_step = 0
         self.tokens_seen = 0
+        self.best_eval_loss = float('inf')  # Track best eval loss
 
     def setup_distributed(self):
         self.is_distributed = int(os.environ.get("WORLD_SIZE", 1)) > 1
@@ -104,7 +105,7 @@ class Trainer:
         if self.is_main:
             print("\nInitializing model...")
         
-        self.model = create_model()
+        self.model = create_model(use_fp8=self.args.use_fp8)
         self.model = self.model.to(self.device)
 
         if self.is_distributed:
@@ -312,16 +313,33 @@ class Trainer:
                 print(f"Evaluation at step {self.global_step}")
                 print(f"  Eval Loss: {eval_loss:.4f}")
                 print(f"  Eval PPL: {eval_ppl:.2f}")
+                
+                # Check if this is the best model so far
+                is_best = eval_loss < self.best_eval_loss
+                if is_best:
+                    prev_best = self.best_eval_loss
+                    self.best_eval_loss = eval_loss
+                    if prev_best == float('inf'):
+                        print(f"  🎯 New best eval loss!")
+                    else:
+                        print(f"  🎯 New best eval loss! (previous: {prev_best:.4f})")
+                else:
+                    print(f"  Best eval loss: {self.best_eval_loss:.4f}")
                 print(f"{'='*60}\n")
 
                 if WANDB_AVAILABLE and not self.args.no_wandb:
                     wandb.log({
                         "eval/loss": eval_loss,
                         "eval/perplexity": eval_ppl,
+                        "eval/best_loss": self.best_eval_loss,
                         "step": self.global_step,
                     })
 
-            # Checkpointing
+                # Save best model checkpoint
+                if is_best:
+                    self.save_checkpoint(is_best=True)
+
+            # Regular checkpointing
             if self.global_step % self.args.save_interval == 0 and self.is_main:
                 self.save_checkpoint()
 
@@ -329,11 +347,13 @@ class Trainer:
             print("\nTraining completed!")
             self.save_checkpoint(final=True)
 
-    def save_checkpoint(self, final: bool = False):
+    def save_checkpoint(self, final: bool = False, is_best: bool = False):
         os.makedirs(self.args.checkpoint_dir, exist_ok=True)
         
         if final:
             checkpoint_path = os.path.join(self.args.checkpoint_dir, "final_model.pt")
+        elif is_best:
+            checkpoint_path = os.path.join(self.args.checkpoint_dir, "best_model.pt")
         else:
             checkpoint_path = os.path.join(self.args.checkpoint_dir, f"checkpoint_step_{self.global_step}.pt")
 
@@ -342,11 +362,16 @@ class Trainer:
             "optimizer": self.optimizer.state_dict(),
             "step": self.global_step,
             "tokens_seen": self.tokens_seen,
+            "best_eval_loss": self.best_eval_loss,
             "args": vars(self.args),
         }
 
         torch.save(checkpoint, checkpoint_path)
-        print(f"Checkpoint saved: {checkpoint_path}")
+        
+        if is_best:
+            print(f"💾 Best model checkpoint saved: {checkpoint_path}")
+        else:
+            print(f"💾 Checkpoint saved: {checkpoint_path}")
 
 
 def main():
@@ -354,6 +379,7 @@ def main():
     
     # Model args
     parser.add_argument("--max_seq_len", type=int, default=2048)
+    parser.add_argument("--use_fp8", action="store_true", help="Enable FP8 training (requires transformer_engine and H100+ GPU)")
     
     # Training args
     parser.add_argument("--batch_size", type=int, default=16)
@@ -376,7 +402,7 @@ def main():
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--eval_interval", type=int, default=500)
     parser.add_argument("--eval_batches", type=int, default=50)
-    parser.add_argument("--save_interval", type=int, default=5000)
+    parser.add_argument("--save_interval", type=int, default=500, help="Save checkpoint every N steps")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints")
     parser.add_argument("--wandb_project", type=str, default="dense-llm-pretraining")
     parser.add_argument("--run_name", type=str, default="dense-180m")

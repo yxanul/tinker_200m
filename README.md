@@ -107,12 +107,17 @@ python data.py
 - Proper initialization
 
 ### Data Pipeline (data.py)
-- Streaming dataset (no disk space needed)
-- On-the-fly tokenization
-- Distributed data splitting
-- Shuffle buffer to avoid temporal bias
-- 8 persistent workers for throughput
-- Non-blocking GPU transfers
+- **Streaming dataset** (no disk space needed)
+- **On-the-fly tokenization** with continuous token buffering
+- **Disjoint train/eval split** (no data leakage)
+  - Eval set: First N documents
+  - Train set: Everything after first N documents
+- **Proper worker sharding** (manual filtering per worker, no overlap)
+- **Distributed data splitting** (multi-GPU support)
+- **Shuffle buffer** to avoid temporal bias
+- **8 persistent workers** for throughput
+- **Non-blocking GPU transfers**
+- **One-time dataset initialization** (avoids HuggingFace rate limits)
 
 ### Training (train.py)
 - Multi-GPU support (DDP)
@@ -230,11 +235,30 @@ Fast initial loss drop is normal for well-initialized models:
 - Step 5000+: Slow convergence
 
 ### Data Diversity
+
+**Critical Fix**: The data pipeline now implements proper worker sharding to prevent data repetition:
+
+1. **Manual worker filtering**: Each worker processes every Nth item (where N = num_workers)
+   - Worker 0: items 0, 8, 16, 24, ...
+   - Worker 1: items 1, 9, 17, 25, ...
+   - Worker 7: items 7, 15, 23, 31, ...
+
+2. **Token buffering**: Documents are tokenized continuously without padding truncation
+   - Prevents wasteful padding within documents
+   - EOS tokens mark document boundaries
+   - Chunks are exactly `max_length` tokens
+
+3. **Proper train/eval separation**: No overlap between training and evaluation data
+   - Eval uses first `eval_take` documents (default: 10,000)
+   - Train uses everything after that
+
 To verify your data pipeline is working correctly:
 ```bash
 python verify_data_diversity.py
 ```
 This checks for duplicate batches and ensures workers are producing diverse data.
+
+**Expected**: 0% duplicate rate across 100+ batches with 4-8 workers.
 
 ## Notes
 

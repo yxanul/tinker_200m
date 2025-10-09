@@ -23,6 +23,7 @@ def verify_diversity(num_batches=100, batch_size=4, num_workers=4):
         num_workers=num_workers,
         buffer_size=1000,
         seed=42,
+        eval_take=1000,  # Small eval set
     )
     
     seen_hashes = set()
@@ -81,6 +82,7 @@ def test_first_tokens(num_batches=5, batch_size=2, num_workers=4):
         num_workers=num_workers,
         buffer_size=1000,
         seed=42,
+        eval_take=1000,
     )
     
     for i, batch in enumerate(train_loader):

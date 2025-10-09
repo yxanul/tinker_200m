@@ -147,6 +147,9 @@ class Trainer:
     def setup_data(self):
         if self.is_main:
             print("\nInitializing dataloaders...")
+            print(f"  Creating disjoint train/eval split:")
+            print(f"    Eval set: First {self.args.eval_take} documents")
+            print(f"    Train set: Everything after first {self.args.eval_take} documents")
 
         self.train_loader, self.eval_loader = create_dataloaders(
             batch_size=self.args.batch_size,
@@ -154,6 +157,7 @@ class Trainer:
             num_workers=self.args.num_workers,
             buffer_size=self.args.buffer_size,
             seed=self.args.seed,
+            eval_take=self.args.eval_take,
             pin_memory=True,
         )
 
@@ -358,6 +362,7 @@ def main():
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--buffer_size", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--eval_take", type=int, default=10000, help="Number of documents for disjoint eval set")
     
     # Logging args
     parser.add_argument("--log_interval", type=int, default=10)

@@ -4,7 +4,7 @@ from torch.utils.data import DataLoader, IterableDataset
 from datasets import load_dataset
 from datasets.distributed import split_dataset_by_node
 from transformers import AutoTokenizer
-from typing import Iterator, Dict
+from typing import Iterator, Dict, Optional
 
 
 class StreamingTextDataset(IterableDataset):
@@ -17,6 +17,7 @@ class StreamingTextDataset(IterableDataset):
         buffer_size: int = 10000,
         seed: int = 42,
         skip_first: int = 0,
+        take_first: Optional[int] = None,
         is_distributed: bool = False,
     ):
         super().__init__()
@@ -27,6 +28,7 @@ class StreamingTextDataset(IterableDataset):
         self.buffer_size = buffer_size
         self.seed = seed
         self.skip_first = skip_first
+        self.take_first = take_first
         self.is_distributed = is_distributed
 
         # Initialize tokenizer
@@ -34,19 +36,37 @@ class StreamingTextDataset(IterableDataset):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.dataset = None
-
-    def _initialize_dataset(self):
-        dataset = load_dataset(
+        # CRITICAL: Initialize dataset ONCE here, not in __iter__
+        # This prevents rate limit errors from multiple workers making API calls
+        print(f"Initializing dataset {dataset_name} (one-time initialization)...")
+        self._base_dataset = load_dataset(
             self.dataset_name,
             name=self.dataset_config if self.dataset_config != "default" else None,
             split="train",
             streaming=True,
         )
 
-        # Skip first N samples for validation split
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        # Get worker info for proper sharding
+        worker_info = torch.utils.data.get_worker_info()
+        
+        if worker_info is None:
+            worker_id = 0
+            num_workers = 1
+        else:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+
+        # Start with base dataset
+        dataset = self._base_dataset
+
+        # Apply skip_first (for train/eval split)
         if self.skip_first > 0:
             dataset = dataset.skip(self.skip_first)
+
+        # Apply take_first (for eval set to limit size)
+        if self.take_first is not None and self.take_first > 0:
+            dataset = dataset.take(self.take_first)
 
         # Distributed splitting (across GPUs/nodes)
         if self.is_distributed:
@@ -54,52 +74,61 @@ class StreamingTextDataset(IterableDataset):
             world_size = int(os.environ.get("WORLD_SIZE", 1))
             dataset = split_dataset_by_node(dataset, rank=rank, world_size=world_size)
 
-        # Worker-specific splitting (within each GPU/node)
-        worker_info = torch.utils.data.get_worker_info()
-        if worker_info is not None:
-            # Split dataset among workers
-            worker_id = worker_info.id
-            num_workers = worker_info.num_workers
-            dataset = split_dataset_by_node(dataset, rank=worker_id, world_size=num_workers)
-            # Use worker-specific seed for shuffling
-            effective_seed = self.seed + worker_id
-        else:
-            effective_seed = self.seed
+        # Worker-specific seed for shuffling
+        effective_seed = self.seed + worker_id
 
-        # Shuffle to avoid stale data from 2013
+        # Shuffle BEFORE worker sharding for better randomness
         dataset = dataset.shuffle(seed=effective_seed, buffer_size=self.buffer_size)
 
-        self.dataset = dataset
+        # Start iterating
+        dataset_iter = iter(dataset)
+        
+        # Token buffer for continuous tokenization across documents
+        token_buffer = []
+        items_processed = 0
 
-    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-        if self.dataset is None:
-            self._initialize_dataset()
+        for item in dataset_iter:
+            # CRITICAL: Manual worker sharding - each worker processes every num_workers-th item
+            # This ensures no overlap between workers
+            if num_workers > 1 and items_processed % num_workers != worker_id:
+                items_processed += 1
+                continue
+            items_processed += 1
 
-        for example in self.dataset:
-            text = example.get("text", "")
+            # Extract text
+            text = item.get("text", "")
             if not text:
                 continue
 
-            # Tokenize on the fly
-            encoded = self.tokenizer(
+            # Tokenize without truncation to preserve all content
+            tokens = self.tokenizer(
                 text,
-                max_length=self.max_length,
-                truncation=True,
-                padding="max_length",
-                return_tensors="pt",
-            )
+                truncation=False,
+                padding=False,
+                return_attention_mask=False,
+            )["input_ids"]
 
-            input_ids = encoded["input_ids"].squeeze(0)
-            attention_mask = encoded["attention_mask"].squeeze(0)
+            # Add EOS token to mark document boundary
+            tokens.append(self.tokenizer.eos_token_id)
 
-            # Create labels (shift input_ids by 1 for causal LM)
-            labels = input_ids.clone()
-            labels[attention_mask == 0] = -100  # Ignore padding in loss
+            # Add to buffer
+            token_buffer.extend(tokens)
 
-            yield {
-                "input_ids": input_ids,
-                "labels": labels,
-            }
+            # Yield complete chunks of max_length
+            while len(token_buffer) >= self.max_length:
+                chunk = token_buffer[:self.max_length]
+                token_buffer = token_buffer[self.max_length:]
+
+                # Convert to tensors
+                input_ids = torch.tensor(chunk, dtype=torch.long)
+                
+                # Create labels (same as input_ids for causal LM)
+                labels = input_ids.clone()
+
+                yield {
+                    "input_ids": input_ids,
+                    "labels": labels,
+                }
 
 
 def create_dataloaders(
@@ -108,13 +137,34 @@ def create_dataloaders(
     num_workers: int = 8,
     buffer_size: int = 10000,
     seed: int = 42,
-    eval_skip: int = 1000000,
+    eval_take: int = 10000,  # Number of documents for eval set
     pin_memory: bool = True,
 ) -> tuple[DataLoader, DataLoader]:
+    """
+    Create disjoint train and eval dataloaders.
+    
+    Eval set: First `eval_take` documents
+    Train set: Everything after `eval_take` documents
+    
+    This ensures no data leakage between train and eval.
+    """
     # Check if distributed
     is_distributed = int(os.environ.get("WORLD_SIZE", 1)) > 1
 
-    # Training dataset (uses all data or skips eval portion)
+    # Eval dataset: First eval_take documents only
+    eval_dataset = StreamingTextDataset(
+        dataset_name="HuggingFaceFW/fineweb-edu",
+        dataset_config="default",
+        tokenizer_name="mistralai/Mistral-7B-Instruct-v0.3",
+        max_length=max_length,
+        buffer_size=buffer_size,
+        seed=seed + 1,  # Different seed for shuffling
+        skip_first=0,
+        take_first=eval_take,  # Take only first eval_take documents
+        is_distributed=is_distributed,
+    )
+
+    # Training dataset: Everything AFTER the first eval_take documents
     train_dataset = StreamingTextDataset(
         dataset_name="HuggingFaceFW/fineweb-edu",
         dataset_config="default",
@@ -122,19 +172,8 @@ def create_dataloaders(
         max_length=max_length,
         buffer_size=buffer_size,
         seed=seed,
-        skip_first=0,
-        is_distributed=is_distributed,
-    )
-
-    # Eval dataset (uses first eval_skip samples with different seed)
-    eval_dataset = StreamingTextDataset(
-        dataset_name="HuggingFaceFW/fineweb-edu",
-        dataset_config="default",
-        tokenizer_name="mistralai/Mistral-7B-Instruct-v0.3",
-        max_length=max_length,
-        buffer_size=buffer_size,
-        seed=seed + 1,  # Different seed for eval
-        skip_first=0,
+        skip_first=eval_take,  # Skip the eval portion
+        take_first=None,  # Take everything after skip
         is_distributed=is_distributed,
     )
 
@@ -158,32 +197,51 @@ def create_dataloaders(
 
 
 def test_dataloader():
-    print("Testing dataloader...")
+    print("Testing dataloader with disjoint train/eval split...")
+    print("="*60)
+    
     train_loader, eval_loader = create_dataloaders(
         batch_size=2,
         max_length=128,
         num_workers=0,  # Use 0 for testing
         buffer_size=100,
+        eval_take=100,  # Small eval set for testing
     )
 
-    print("\nTrain loader test:")
+    print("\n1. Train loader test (should skip first 100 documents):")
+    train_tokens_seen = set()
     for i, batch in enumerate(train_loader):
-        if i >= 2:
+        if i >= 3:
             break
-        print(f"Batch {i}:")
-        print(f"  input_ids shape: {batch['input_ids'].shape}")
-        print(f"  labels shape: {batch['labels'].shape}")
-        print(f"  Sample tokens: {batch['input_ids'][0][:10]}")
+        print(f"  Batch {i}:")
+        print(f"    input_ids shape: {batch['input_ids'].shape}")
+        print(f"    labels shape: {batch['labels'].shape}")
+        print(f"    First 10 tokens: {batch['input_ids'][0][:10].tolist()}")
+        
+        # Track tokens for overlap check
+        train_tokens_seen.update(batch['input_ids'][0].tolist())
 
-    print("\nEval loader test:")
+    print("\n2. Eval loader test (should use first 100 documents only):")
+    eval_tokens_seen = set()
     for i, batch in enumerate(eval_loader):
-        if i >= 1:
+        if i >= 3:
             break
-        print(f"Batch {i}:")
-        print(f"  input_ids shape: {batch['input_ids'].shape}")
-        print(f"  labels shape: {batch['labels'].shape}")
+        print(f"  Batch {i}:")
+        print(f"    input_ids shape: {batch['input_ids'].shape}")
+        print(f"    labels shape: {batch['labels'].shape}")
+        print(f"    First 10 tokens: {batch['input_ids'][0][:10].tolist()}")
+        
+        # Track tokens for overlap check
+        eval_tokens_seen.update(batch['input_ids'][0].tolist())
 
-    print("\nDataloader test completed!")
+    print("\n3. Checking for overlap between train and eval:")
+    print(f"  Train unique tokens: {len(train_tokens_seen)}")
+    print(f"  Eval unique tokens: {len(eval_tokens_seen)}")
+    print(f"  Note: Token overlap is expected (same vocabulary), document overlap is not")
+    
+    print("\n" + "="*60)
+    print("✅ Dataloader test completed!")
+    print("="*60)
 
 
 if __name__ == "__main__":

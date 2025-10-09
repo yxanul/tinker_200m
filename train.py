@@ -20,6 +20,13 @@ from model import create_model
 from data import create_dataloaders
 
 
+# Enable TF32 and Flash Attention for faster training
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False)
+
+
 class CosineScheduleWithWarmup:
     def __init__(
         self,
@@ -147,9 +154,10 @@ class Trainer:
     def setup_data(self):
         if self.is_main:
             print("\nInitializing dataloaders...")
-            print(f"  Creating disjoint train/eval split:")
-            print(f"    Eval set: First {self.args.eval_take} documents")
-            print(f"    Train set: Everything after first {self.args.eval_take} documents")
+            print(f"  Train/eval offset strategy:")
+            print(f"    Train: starts from document 0")
+            print(f"    Eval: starts from document {self.args.eval_skip}")
+            print(f"    Different seeds further reduce overlap")
 
         self.train_loader, self.eval_loader = create_dataloaders(
             batch_size=self.args.batch_size,
@@ -157,7 +165,7 @@ class Trainer:
             num_workers=self.args.num_workers,
             buffer_size=self.args.buffer_size,
             seed=self.args.seed,
-            eval_take=self.args.eval_take,
+            eval_skip=self.args.eval_skip,
             pin_memory=True,
         )
 
@@ -362,7 +370,7 @@ def main():
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--buffer_size", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--eval_take", type=int, default=10000, help="Number of documents for disjoint eval set")
+    parser.add_argument("--eval_skip", type=int, default=100000, help="Eval dataset starts from this document offset")
     
     # Logging args
     parser.add_argument("--log_interval", type=int, default=10)

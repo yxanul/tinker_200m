@@ -9,10 +9,13 @@ try:
     from transformer_engine.common.recipe import DelayedScaling, Format
     HAS_TE = True
     
-    # Check for NVFP4 support (TE 2.8+) - E2M1 format
-    HAS_NVFP4 = hasattr(Format, 'E2M1')
-    if HAS_NVFP4:
-        print("✓ NVFP4 (E2M1) format detected in TE 2.8!")
+    # Check for NVFP4 support (TE 2.8+) - NVFP4BlockScaling
+    try:
+        from transformer_engine.common.recipe import NVFP4BlockScaling
+        HAS_NVFP4 = True
+        print("✓ NVFP4BlockScaling detected in TE 2.8!")
+    except ImportError:
+        HAS_NVFP4 = False
 except ImportError:
     HAS_TE = False
     HAS_NVFP4 = False
@@ -300,34 +303,20 @@ class DenseTransformer(nn.Module):
         
         if self.use_nvfp4 and not HAS_NVFP4:
             raise RuntimeError(
-                "NVFP4 training requested but E2M1 format not available. "
+                "NVFP4 training requested but NVFP4BlockScaling not available. "
                 "Requires: Transformer Engine 2.8+ and Blackwell GPU (RTX 5090, B200, etc.)"
             )
         
         # FP8/NVFP4 recipe
         if self.use_nvfp4:
-            # NVFP4 Hybrid recipe: E2M1 forward (4-bit), E5M2 backward (8-bit for stability)
-            # Forward: Aggressive 4-bit for maximum speed
-            # Backward: 8-bit gradients for training stability
-            self.fp8_recipe_forward = DelayedScaling(
-                fp8_format=Format.E2M1,  # NVFP4 forward (4-bit)
-                amax_history_len=16,
-                amax_compute_algo="max",
-                fp8_dpa=True,
-            )
-            self.fp8_recipe_backward = DelayedScaling(
-                fp8_format=Format.E5M2,  # FP8 backward (8-bit for stability)
-                amax_history_len=16,
-                amax_compute_algo="max",
-                fp8_dpa=True,
-            )
-            # Use forward recipe as default for autocast
-            self.fp8_recipe = self.fp8_recipe_forward
+            # NVFP4 recipe: Uses NVFP4BlockScaling (4-bit block scaling)
+            # TE automatically handles forward/backward precision internally
+            self.fp8_recipe = NVFP4BlockScaling()
             self.use_hybrid_nvfp4 = True
             
-            print("✓ Hybrid NVFP4 training enabled")
-            print("  - Forward: E2M1 (4-bit, maximum speed)")
-            print("  - Backward: E5M2 (8-bit, gradient stability)")
+            print("✓ NVFP4 training enabled (4-bit block scaling)")
+            print("  - Using NVFP4BlockScaling recipe")
+            print("  - TE automatically handles forward/backward precision")
             print("✓ Fused QKV enabled (single kernel for Q/K/V projections)")
             if use_te_attention:
                 print("✓ NVFP4 DotProductAttention enabled")
@@ -391,15 +380,11 @@ class DenseTransformer(nn.Module):
         
         # Use FP8/NVFP4 autocast if enabled
         if self.use_hybrid_nvfp4:
-            # Hybrid NVFP4: E2M1 (4-bit) forward, E5M2 (8-bit) backward for stability
-            # Forward pass: Use E2M1 (4-bit) for maximum speed
-            with te.fp8_autocast(enabled=True, fp8_recipe=self.fp8_recipe_forward):
+            # NVFP4: 4-bit block scaling (TE handles forward/backward precision internally)
+            with te.fp8_autocast(enabled=True, fp8_recipe=self.fp8_recipe):
                 h = self._forward_impl(input_ids, seq_len)
                 h = self.norm(h)
                 logits = self.output(h)
-            
-            # For backward pass, TE will automatically use proper precision
-            # We rely on TE's gradient computation in E5M2 (8-bit) for stability
         elif self.use_fp8:
             # Standard FP8: E4M3 forward, E5M2 backward (HYBRID)
             with te.fp8_autocast(enabled=True, fp8_recipe=self.fp8_recipe):
@@ -513,13 +498,13 @@ def create_model(
     if use_nvfp4:
         if HAS_NVFP4:
             print("✓ NVFP4 training mode enabled")
-            print("  - Format: E2M1 (4-bit floating point)")
+            print("  - Recipe: NVFP4BlockScaling (4-bit block scaling)")
             print("  - Fused QKV: Single kernel for Q/K/V")
             print("  - NVFP4 attention: QK^T + softmax in 4-bit")
             print("  - Requires: RTX 5090, B200, or newer Blackwell GPU")
             print("  - Expected speedup: 2.0-3.0x over BF16 (experimental)")
         else:
-            print("⚠ NVFP4 requested but E2M1 format not available")
+            print("⚠ NVFP4 requested but NVFP4BlockScaling not available")
             print("  Requires: Transformer Engine 2.8+ and Blackwell GPU")
     elif use_fp8:
         if HAS_TE:

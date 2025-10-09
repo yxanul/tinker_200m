@@ -105,7 +105,18 @@ class Trainer:
         if self.is_main:
             print("\nInitializing model...")
         
-        self.model = create_model(use_fp8=self.args.use_fp8)
+        # Note: TE FP8 attention doesn't work with torch.compile
+        # If both are requested, we disable TE attention and use PyTorch Flash Attention
+        use_fp8_compute = self.args.use_fp8
+        use_te_attention = self.args.use_fp8 and not self.args.compile
+        
+        if self.args.use_fp8 and self.args.compile and self.is_main:
+            print("\n⚠️  Note: torch.compile + FP8 mode")
+            print("  - FP8 compute: Enabled (Linear, RMSNorm, Fused QKV)")
+            print("  - TE attention: Disabled (incompatible with compile)")
+            print("  - Using PyTorch Flash Attention instead")
+        
+        self.model = create_model(use_fp8=use_fp8_compute, use_te_attention=use_te_attention)
         self.model = self.model.to(self.device)
         
         # Compile model for additional 10-20% speedup

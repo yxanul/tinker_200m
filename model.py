@@ -70,6 +70,7 @@ class GroupedQueryAttention(nn.Module):
         use_qk_norm: bool = True,
         use_flash: bool = True,
         use_fp8: bool = False,
+        use_te_attention: bool = True,
     ):
         super().__init__()
         self.d_model = d_model
@@ -79,6 +80,7 @@ class GroupedQueryAttention(nn.Module):
         self.n_rep = n_heads // n_kv_heads
         self.use_flash = use_flash and hasattr(F, 'scaled_dot_product_attention')
         self.use_fp8 = use_fp8 and HAS_TE
+        self.use_te_attention = use_te_attention and self.use_fp8 and HAS_TE
 
         if self.use_fp8 and not HAS_TE:
             raise RuntimeError("FP8 requested but transformer_engine not available. Install with: pip install transformer-engine")
@@ -89,12 +91,13 @@ class GroupedQueryAttention(nn.Module):
             self.qkv_proj = te.Linear(d_model, (n_heads + 2 * n_kv_heads) * head_dim, bias=False)
             self.use_fused_qkv = True
             
-            # TE FP8 DotProductAttention (FP8-optimized attention)
-            self.te_attn = te.DotProductAttention(
-                num_attention_heads=n_heads,
-                kv_channels=head_dim,
-                attention_dropout=0.0,
-            )
+            # TE FP8 DotProductAttention (only if not using torch.compile)
+            if self.use_te_attention:
+                self.te_attn = te.DotProductAttention(
+                    num_attention_heads=n_heads,
+                    kv_channels=head_dim,
+                    attention_dropout=0.0,
+                )
         else:
             # Separate projections for non-FP8 mode
             self.q_proj = nn.Linear(d_model, n_heads * head_dim, bias=False)
@@ -156,7 +159,7 @@ class GroupedQueryAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        if self.use_fp8:
+        if self.use_te_attention:
             # TE FP8 attention expects (B, S, H, D) layout
             q_te = q.transpose(1, 2).contiguous()  # (B, S, H, D)
             k_te = k.transpose(1, 2).contiguous()
@@ -226,6 +229,7 @@ class TransformerBlock(nn.Module):
         use_qk_norm: bool = True,
         use_flash: bool = True,
         use_fp8: bool = False,
+        use_te_attention: bool = True,
     ):
         super().__init__()
         self.use_fp8 = use_fp8 and HAS_TE
@@ -237,7 +241,7 @@ class TransformerBlock(nn.Module):
         NormLayer = te.RMSNorm if self.use_fp8 else RMSNorm
         
         self.attn_norm = NormLayer(d_model, eps=norm_eps) if self.use_fp8 else RMSNorm(d_model, norm_eps)
-        self.attn = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, use_qk_norm, use_flash, use_fp8)
+        self.attn = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, use_qk_norm, use_flash, use_fp8, use_te_attention)
         self.ffn_norm = NormLayer(d_model, eps=norm_eps) if self.use_fp8 else RMSNorm(d_model, norm_eps)
         self.ffn = SwiGLU(d_model, ffn_hidden, use_fp8)
 
@@ -270,6 +274,7 @@ class DenseTransformer(nn.Module):
         use_flash: bool = True,
         tie_weights: bool = True,
         use_fp8: bool = False,
+        use_te_attention: bool = True,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -295,7 +300,10 @@ class DenseTransformer(nn.Module):
             )
             print("✓ FP8 training enabled (E4M3 forward, E5M2 backward)")
             print("✓ Fused QKV enabled (single kernel for Q/K/V projections)")
-            print("✓ FP8 DotProductAttention enabled (FP8 QK^T + softmax)")
+            if use_te_attention:
+                print("✓ FP8 DotProductAttention enabled (FP8 QK^T + softmax)")
+            else:
+                print("✓ PyTorch Flash Attention (FP8 incompatible with torch.compile)")
         else:
             self.fp8_recipe = None
 
@@ -305,7 +313,7 @@ class DenseTransformer(nn.Module):
         self.layers = nn.ModuleList([
             TransformerBlock(
                 d_model, n_heads, n_kv_heads, head_dim, ffn_hidden,
-                norm_eps, use_qk_norm, use_flash, use_fp8
+                norm_eps, use_qk_norm, use_flash, use_fp8, use_te_attention
             )
             for _ in range(n_layers)
         ])
@@ -380,13 +388,14 @@ class DenseTransformer(nn.Module):
         return n_params
 
 
-def create_model(use_fp8: bool = False):
+def create_model(use_fp8: bool = False, use_te_attention: bool = True):
     """
     Create a DenseTransformer model.
     
     Args:
         use_fp8: Enable FP8 training (requires transformer_engine and H100+ GPU)
                  E4M3 format for forward pass, E5M2 for backward pass
+        use_te_attention: Use TE FP8 attention (incompatible with torch.compile)
     
     Returns:
         DenseTransformer model
@@ -406,6 +415,7 @@ def create_model(use_fp8: bool = False):
         use_flash=True,
         tie_weights=True,
         use_fp8=use_fp8,
+        use_te_attention=use_te_attention,
     )
     
     total_params = model.get_num_params(non_embedding=False) / 1e6

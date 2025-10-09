@@ -107,17 +107,18 @@ python data.py
 - Proper initialization
 
 ### Data Pipeline (data.py)
-- **Streaming dataset** (no disk space needed)
+- **Streaming dataset** (no disk space needed, infinite iteration)
 - **On-the-fly tokenization** with continuous token buffering
-- **Disjoint train/eval split** (no data leakage)
-  - Eval set: First N documents
-  - Train set: Everything after first N documents
+- **Offset-based train/eval separation** (minimal overlap probability)
+  - Train: starts from document 0, seed 42
+  - Eval: starts from document 100K, seed 1041
+  - Both are infinite streams (no iterator exhaustion)
 - **Proper worker sharding** (manual filtering per worker, no overlap)
 - **Distributed data splitting** (multi-GPU support)
 - **Shuffle buffer** to avoid temporal bias
 - **8 persistent workers** for throughput
 - **Non-blocking GPU transfers**
-- **One-time dataset initialization** (avoids HuggingFace rate limits)
+- **Fresh dataset loading** per `__iter__()` call (prevents data repetition)
 
 ### Training (train.py)
 - Multi-GPU support (DDP)
@@ -236,29 +237,38 @@ Fast initial loss drop is normal for well-initialized models:
 
 ### Data Diversity
 
-**Critical Fix**: The data pipeline now implements proper worker sharding to prevent data repetition:
+**Critical Fix Applied**: The data pipeline uses **infinite streams** to prevent iterator exhaustion and data repetition:
 
-1. **Manual worker filtering**: Each worker processes every Nth item (where N = num_workers)
+1. **Infinite streaming** (no `take()` operation)
+   - Both train and eval are infinite streams
+   - Workers never exhaust their data source
+   - Fresh dataset loaded in each `__iter__()` call
+   - Prevents the bug: `take(N)` + `persistent_workers` = data loop
+
+2. **Manual worker filtering**: Each worker processes every Nth item (where N = num_workers)
    - Worker 0: items 0, 8, 16, 24, ...
    - Worker 1: items 1, 9, 17, 25, ...
    - Worker 7: items 7, 15, 23, 31, ...
 
-2. **Token buffering**: Documents are tokenized continuously without padding truncation
+3. **Token buffering**: Documents are tokenized continuously without padding truncation
    - Prevents wasteful padding within documents
    - EOS tokens mark document boundaries
    - Chunks are exactly `max_length` tokens
 
-3. **Proper train/eval separation**: No overlap between training and evaluation data
-   - Eval uses first `eval_take` documents (default: 10,000)
-   - Train uses everything after that
+4. **Offset-based train/eval separation**: Different starting positions
+   - Train starts from document 0 (seed 42)
+   - Eval starts from document 100K (seed 1041)
+   - Minimal overlap probability with shuffle buffers
 
-To verify your data pipeline is working correctly:
+**Verification**:
 ```bash
 python verify_data_diversity.py
 ```
 This checks for duplicate batches and ensures workers are producing diverse data.
 
 **Expected**: 0% duplicate rate across 100+ batches with 4-8 workers.
+
+**Root Cause**: Previously used `take()` which created finite iterators that exhausted and restarted from the same documents. Now using infinite streams that never repeat.
 
 ## Notes
 

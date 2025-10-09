@@ -230,9 +230,14 @@ class DenseTransformer(nn.Module):
 
         loss = None
         if labels is not None:
+            # Shift logits and labels for next-token prediction
+            # logits[:, :-1] predicts labels[:, 1:]
+            # This ensures position i predicts token i+1, not token i
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
             loss = F.cross_entropy(
-                logits.view(-1, self.vocab_size),
-                labels.view(-1),
+                shift_logits.view(-1, self.vocab_size),
+                shift_labels.view(-1),
                 ignore_index=-100
             )
 

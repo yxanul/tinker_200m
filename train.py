@@ -105,14 +105,23 @@ class Trainer:
         if self.is_main:
             print("\nInitializing model...")
         
-        # Note: TE FP8 attention doesn't work with torch.compile
+        # Note: TE FP8/NVFP4 attention doesn't work with torch.compile
         # If both are requested, we disable TE attention and use PyTorch Flash Attention
         use_fp8_compute = self.args.use_fp8
-        use_te_attention = self.args.use_fp8 and not self.args.compile
+        use_nvfp4_compute = self.args.use_nvfp4
+        use_te_attention = (self.args.use_fp8 or self.args.use_nvfp4) and not self.args.compile
         
-        if self.args.use_fp8 and self.args.compile and self.is_main:
-            print("\n⚠️  Note: torch.compile + FP8 mode")
-            print("  - FP8 compute: Enabled (Linear, RMSNorm, Fused QKV)")
+        # Mutual exclusivity check
+        if self.args.use_fp8 and self.args.use_nvfp4:
+            if self.is_main:
+                print("\n⚠️  Warning: Both --use_fp8 and --use_nvfp4 specified")
+                print("  Using NVFP4 (E2M1 4-bit) instead of FP8 (E4M3/E5M2 8-bit)")
+            use_fp8_compute = False  # NVFP4 takes precedence
+        
+        if (self.args.use_fp8 or self.args.use_nvfp4) and self.args.compile and self.is_main:
+            format_name = "NVFP4 (E2M1)" if self.args.use_nvfp4 else "FP8 (E4M3/E5M2)"
+            print(f"\n⚠️  Note: torch.compile + {format_name} mode")
+            print(f"  - {format_name} compute: Enabled (Linear, RMSNorm, Fused QKV)")
             print("  - TE attention: Disabled (incompatible with compile)")
             print("  - Using PyTorch Flash Attention instead")
         
@@ -129,6 +138,7 @@ class Trainer:
             ffn_hidden=ffn_hidden,
             max_seq_len=self.args.max_seq_len,
             use_fp8=use_fp8_compute,
+            use_nvfp4=use_nvfp4_compute,
             use_te_attention=use_te_attention,
         )
         self.model = self.model.to(self.device)
@@ -434,7 +444,8 @@ def main():
     parser.add_argument("--n_kv_heads", type=int, default=4, help="Number of KV heads for GQA")
     parser.add_argument("--ffn_hidden", type=int, default=None, help="FFN hidden size (default: 2.67 × d_model for SwiGLU)")
     parser.add_argument("--max_seq_len", type=int, default=2048)
-    parser.add_argument("--use_fp8", action="store_true", help="Enable FP8 training (requires transformer_engine and H100+ GPU)")
+    parser.add_argument("--use_fp8", action="store_true", help="Enable FP8 training (E4M3/E5M2, requires H100+)")
+    parser.add_argument("--use_nvfp4", action="store_true", help="Enable NVFP4 training (E2M1 4-bit, requires RTX 5090/B200+)")
     parser.add_argument("--compile", action="store_true", help="Compile model with torch.compile (10-20% faster)")
     parser.add_argument("--compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
     

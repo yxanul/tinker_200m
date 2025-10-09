@@ -107,6 +107,26 @@ class Trainer:
         
         self.model = create_model(use_fp8=self.args.use_fp8)
         self.model = self.model.to(self.device)
+        
+        # Compile model for additional 10-20% speedup
+        if self.args.compile:
+            if self.is_main:
+                print(f"\nCompiling model with torch.compile (mode: {self.args.compile_mode})...")
+                print("  ⏳ First iteration will be slow (~30 sec - 10 min depending on mode)")
+                print("  After compilation, expect 10-20% throughput increase")
+            
+            try:
+                self.model = torch.compile(
+                    self.model,
+                    mode=self.args.compile_mode,
+                    fullgraph=False,  # Allow graph breaks for TE compatibility
+                )
+                if self.is_main:
+                    print("  ✓ Model compilation enabled")
+            except Exception as e:
+                if self.is_main:
+                    print(f"  ⚠️ Compilation failed: {e}")
+                    print("  Continuing without compilation...")
 
         if self.is_distributed:
             self.model = DDP(self.model, device_ids=[self.rank])
@@ -385,6 +405,8 @@ def main():
     # Model args
     parser.add_argument("--max_seq_len", type=int, default=2048)
     parser.add_argument("--use_fp8", action="store_true", help="Enable FP8 training (requires transformer_engine and H100+ GPU)")
+    parser.add_argument("--compile", action="store_true", help="Compile model with torch.compile (10-20% faster)")
+    parser.add_argument("--compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"], help="torch.compile mode")
     
     # Training args
     parser.add_argument("--batch_size", type=int, default=16)

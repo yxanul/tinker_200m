@@ -116,7 +116,21 @@ class Trainer:
             print("  - TE attention: Disabled (incompatible with compile)")
             print("  - Using PyTorch Flash Attention instead")
         
-        self.model = create_model(use_fp8=use_fp8_compute, use_te_attention=use_te_attention)
+        # Auto-calculate FFN hidden size if not specified (2.67x for SwiGLU)
+        ffn_hidden = self.args.ffn_hidden
+        if ffn_hidden is None:
+            ffn_hidden = int(self.args.d_model * 8 / 3)  # 2.67x rule
+        
+        self.model = create_model(
+            d_model=self.args.d_model,
+            n_layers=self.args.n_layers,
+            n_heads=self.args.n_heads,
+            n_kv_heads=self.args.n_kv_heads,
+            ffn_hidden=ffn_hidden,
+            max_seq_len=self.args.max_seq_len,
+            use_fp8=use_fp8_compute,
+            use_te_attention=use_te_attention,
+        )
         self.model = self.model.to(self.device)
         
         # Compile model for additional 10-20% speedup
@@ -414,6 +428,11 @@ def main():
     parser = argparse.ArgumentParser()
     
     # Model args
+    parser.add_argument("--d_model", type=int, default=768, help="Model dimension (768 for GPT-2 small/medium)")
+    parser.add_argument("--n_layers", type=int, default=32, help="Number of transformer layers (12 for ~125M, 32 for ~180M)")
+    parser.add_argument("--n_heads", type=int, default=12, help="Number of attention heads")
+    parser.add_argument("--n_kv_heads", type=int, default=4, help="Number of KV heads for GQA")
+    parser.add_argument("--ffn_hidden", type=int, default=None, help="FFN hidden size (default: 2.67 × d_model for SwiGLU)")
     parser.add_argument("--max_seq_len", type=int, default=2048)
     parser.add_argument("--use_fp8", action="store_true", help="Enable FP8 training (requires transformer_engine and H100+ GPU)")
     parser.add_argument("--compile", action="store_true", help="Compile model with torch.compile (10-20% faster)")

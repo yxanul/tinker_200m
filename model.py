@@ -388,11 +388,26 @@ class DenseTransformer(nn.Module):
         return n_params
 
 
-def create_model(use_fp8: bool = False, use_te_attention: bool = True):
+def create_model(
+    d_model: int = 768,
+    n_layers: int = 32,
+    n_heads: int = 12,
+    n_kv_heads: int = 4,
+    ffn_hidden: int = 2048,
+    max_seq_len: int = 2048,
+    use_fp8: bool = False,
+    use_te_attention: bool = True,
+):
     """
     Create a DenseTransformer model.
     
     Args:
+        d_model: Model dimension (768 for GPT-2 small/medium)
+        n_layers: Number of transformer layers (12 for ~125M, 32 for ~180M)
+        n_heads: Number of attention heads
+        n_kv_heads: Number of KV heads for GQA
+        ffn_hidden: FFN hidden size (default 2048 = 2.67x for 768d)
+        max_seq_len: Maximum sequence length
         use_fp8: Enable FP8 training (requires transformer_engine and H100+ GPU)
                  E4M3 format for forward pass, E5M2 for backward pass
         use_te_attention: Use TE FP8 attention (incompatible with torch.compile)
@@ -400,15 +415,17 @@ def create_model(use_fp8: bool = False, use_te_attention: bool = True):
     Returns:
         DenseTransformer model
     """
+    head_dim = d_model // n_heads
+    
     model = DenseTransformer(
         vocab_size=32768,
-        d_model=768,
-        n_layers=32,
-        n_heads=12,
-        n_kv_heads=4,
-        head_dim=64,
-        ffn_hidden=2048,
-        max_seq_len=2048,
+        d_model=d_model,
+        n_layers=n_layers,
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
+        head_dim=head_dim,
+        ffn_hidden=ffn_hidden,
+        max_seq_len=max_seq_len,
         norm_eps=1e-6,
         rope_theta=10000,
         use_qk_norm=True,
@@ -420,8 +437,18 @@ def create_model(use_fp8: bool = False, use_te_attention: bool = True):
     
     total_params = model.get_num_params(non_embedding=False) / 1e6
     non_emb_params = model.get_num_params(non_embedding=True) / 1e6
-    print(f"Total parameters: {total_params:.2f}M")
-    print(f"Non-embedding parameters: {non_emb_params:.2f}M")
+    
+    print(f"\nModel Architecture:")
+    print(f"  d_model: {d_model}")
+    print(f"  n_layers: {n_layers}")
+    print(f"  n_heads: {n_heads} (KV heads: {n_kv_heads}, ratio: {n_heads//n_kv_heads}:1)")
+    print(f"  head_dim: {head_dim}")
+    print(f"  ffn_hidden: {ffn_hidden} ({ffn_hidden/d_model:.2f}x d_model)")
+    print(f"  vocab_size: 32768")
+    print(f"  max_seq_len: {max_seq_len}")
+    print(f"\nModel Size:")
+    print(f"  Total parameters: {total_params:.2f}M")
+    print(f"  Non-embedding parameters: {non_emb_params:.2f}M")
     
     if use_fp8:
         if HAS_TE:
